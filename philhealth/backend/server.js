@@ -6,7 +6,9 @@ import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { createDatabase } from './db.js';
 import { schemas, validate } from './routes/schemas.js';
-import { appendAudit, attachAuth, canAccessClaim, clearSessionCookie, issuePreAuthSession, isLockedOut, recordLoginAttempt, requireCsrf, signIn } from './auth.js';
+import { appendAudit, attachAuth, clearSessionCookie, issuePreAuthSession, isLockedOut, recordLoginAttempt, requireCsrf, signIn } from './auth.js';
+import { canAccessClaim, transitionError } from './rules.js';
+import { registerWorkflowRoutes } from './workflow.js';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
 const frontendDir = resolve(here, '../frontend');
@@ -28,14 +30,16 @@ function guarded(roles, action) {
 
 function event(db) { return db.prepare('SELECT * FROM calamity_events ORDER BY id LIMIT 1').get(); }
 function regions(db, eventId) {
-  return db.prepare(`SELECT b.region, b.allocation, COALESCE(SUM(CASE WHEN c.status IN ('Approved', 'Paid') THEN c.approved_amount END), 0) AS approved,
-    COALESCE(SUM(CASE WHEN c.status = 'Paid' THEN c.approved_amount END), 0) AS paid
+  return db.prepare(`SELECT b.region, b.allocation, COALESCE(SUM(CASE WHEN c.status IN ('Approved', 'Paid', 'Reconciled') THEN c.approved_amount END), 0) AS approved,
+    COALESCE(SUM(CASE WHEN c.status IN ('Paid', 'Reconciled') THEN c.approved_amount END), 0) AS paid
     FROM region_budgets b LEFT JOIN claims c ON c.event_id = b.event_id AND c.region = b.region
     WHERE b.event_id = ? GROUP BY b.region, b.allocation ORDER BY b.region`).all(eventId)
     .map(row => ({ ...row, level: row.approved > row.allocation ? 'CRITICAL' : row.approved / row.allocation >= .8 ? 'WARNING' : 'OK' }));
 }
 function claimRow(db, ref) {
-  return db.prepare('SELECT ref, event_id, region, patient_token AS token, claim_type AS type, status, claimed_amount AS claimed, approved_amount AS approved, created_at FROM claims WHERE ref = ?').get(ref);
+  return db.prepare(`SELECT ref, event_id, region, patient_token AS token, claim_type AS type, status,
+    claimed_amount AS claimed, approved_amount AS approved, created_at, provider_id, discharge_date,
+    filing_date, decision_date, reason_code, encoded_by, note FROM claims WHERE ref = ?`).get(ref);
 }
 function auditChain(rows) {
   let previous = null;
@@ -69,6 +73,7 @@ export async function buildApp({ database = join(here, 'data', 'calamity.db'), s
     const code = error.statusCode >= 400 && error.statusCode < 500 ? error.statusCode : 500;
     reply.code(code).send({ error: code === 500 ? 'An unexpected error occurred.' : 'Invalid request.' });
   });
+  registerWorkflowRoutes(app, db);
 
   app.get('/api/csrf', { preHandler: validate(schemas.csrf) }, async (request, reply) => {
     if (request.session) return { csrfToken: request.session.csrf_token };
@@ -103,9 +108,10 @@ export async function buildApp({ database = join(here, 'data', 'calamity.db'), s
   });
   app.get('/api/dashboard', { preHandler: validate(schemas.dashboard) }, async (request, reply) => {
     if (!mustBeSignedIn(request, reply)) return;
+    if (request.user.role === 'ADM') return reply.code(403).send({ error: 'Your role is not allowed to perform this action.' });
     const current = event(db); const regionRows = regions(db, current.id);
-    const totals = db.prepare(`SELECT COALESCE(SUM(CASE WHEN status IN ('Approved', 'Paid') THEN approved_amount END), 0) AS committed,
-      COALESCE(SUM(CASE WHEN status = 'Paid' THEN approved_amount END), 0) AS paid,
+    const totals = db.prepare(`SELECT COALESCE(SUM(CASE WHEN status IN ('Approved', 'Paid', 'Reconciled') THEN approved_amount END), 0) AS committed,
+      COALESCE(SUM(CASE WHEN status IN ('Paid', 'Reconciled') THEN approved_amount END), 0) AS paid,
       COUNT(CASE WHEN status = 'Approved' THEN 1 END) AS unpaid FROM claims WHERE event_id = ?`).get(current.id);
     return { event: current, cards: [
       { label: 'Utilization', value: `${((totals.committed / current.budget) * 100).toFixed(2)}%`, level: totals.committed > current.budget ? 'CRITICAL' : totals.committed / current.budget >= .8 ? 'WARNING' : 'OK' },
@@ -116,6 +122,7 @@ export async function buildApp({ database = join(here, 'data', 'calamity.db'), s
   });
   app.get('/api/claims', { preHandler: validate(schemas.claims, 'query') }, async (request, reply) => {
     if (!mustBeSignedIn(request, reply)) return;
+    if (request.user.role === 'ADM') return reply.code(403).send({ error: 'Your role is not allowed to perform this action.' });
     const q = `%${request.validated.q || ''}%`;
     const rows = db.prepare(`SELECT ref, region, patient_token AS token, claim_type AS type, status, claimed_amount AS claimed, approved_amount AS approved
       FROM claims WHERE (ref LIKE ? OR patient_token LIKE ? OR region LIKE ? OR status LIKE ?)
@@ -124,20 +131,27 @@ export async function buildApp({ database = join(here, 'data', 'calamity.db'), s
   });
   app.get('/api/claims/:ref', { preHandler: validate(schemas.claim, 'params') }, async (request, reply) => {
     if (!mustBeSignedIn(request, reply)) return;
+    if (request.user.role === 'ADM') return reply.code(403).send({ error: 'Your role is not allowed to perform this action.' });
     const claim = claimRow(db, request.validated.ref);
     if (!claim || !canAccessClaim(request.user, claim)) return reply.code(404).send({ error: 'Claim not found.' });
-    claim.history = db.prepare('SELECT status, created_at AS at FROM claim_history WHERE claim_ref = ? ORDER BY id').all(claim.ref);
+    claim.history = db.prepare(`SELECT h.status, h.created_at AS at, COALESCE(u.username, 'system') AS actor, h.note
+      FROM claim_history h LEFT JOIN users u ON u.id = h.actor_id WHERE h.claim_ref = ? ORDER BY h.id`).all(claim.ref);
     return claim;
   });
   app.post('/api/claims/:ref/status', { preHandler: [validate(schemas.claimStatus, 'params+body'), requireCsrf] }, async (request, reply) => {
     if (!guarded(['CFB', 'ROS'])(request, reply)) return;
     const claim = claimRow(db, request.validated.ref);
     if (!claim || !canAccessClaim(request.user, claim)) return reply.code(404).send({ error: 'Claim not found.' });
-    const { status } = request.validated;
+    const { status, approved, note = '', reasonCode, overrideReason } = request.validated;
+    const error = transitionError(db, claim, { status, approved, note, reasonCode, overrideReason }, request.user);
+    if (error) return reply.code(422).send({ error });
     const transaction = db.transaction(() => {
-      db.prepare('UPDATE claims SET status = ? WHERE ref = ?').run(status, claim.ref);
-      db.prepare('INSERT INTO claim_history(claim_ref, status, actor_id) VALUES (?, ?, ?)').run(claim.ref, status, request.user.id);
-      appendAudit(db, request.user.id, 'UPDATE_STATUS', 'Claim', claim.ref, `Status changed to ${status}`, { status: claim.status }, { status });
+      const nextApproved = status === 'Approved' ? (approved ?? claim.approved) : claim.approved;
+      db.prepare(`UPDATE claims SET status = ?, approved_amount = ?, reason_code = ?, note = ?,
+        decision_date = CASE WHEN ? = 'Approved' THEN date('now') ELSE decision_date END WHERE ref = ?`)
+        .run(status, nextApproved, reasonCode || null, note, status, claim.ref);
+      db.prepare('INSERT INTO claim_history(claim_ref, status, actor_id, note) VALUES (?, ?, ?, ?)').run(claim.ref, status, request.user.id, note);
+      appendAudit(db, request.user.id, 'UPDATE_STATUS', 'Claim', claim.ref, `Status changed to ${status}`, { status: claim.status }, { status, approved: nextApproved });
     });
     transaction();
     return claimRow(db, claim.ref);

@@ -41,11 +41,11 @@ async function seed(db, allowDemo) {
       [
         ['CLM-001-XI-00001', 'CE-2026-001', 'XI', 'PT-1024', 'Inpatient', 'Approved', 342000, 318000],
         ['CLM-001-VII-00012', 'CE-2026-001', 'VII', 'PT-0981', 'Outpatient', 'Paid', 270000, 242000],
-        ['CLM-001-IVA-00009', 'CE-2026-001', 'IVA', 'PT-0877', 'Inpatient', 'Under review', 210000, 184000],
+        ['CLM-001-IVA-00009', 'CE-2026-001', 'IVA', 'PT-0877', 'Inpatient', 'Under Review', 210000, 184000],
         ['CLM-001-XI-00017', 'CE-2026-001', 'XI', 'PT-1146', 'Outpatient', 'Approved', 362000, 350000]
       ].forEach(row => claim.run(...row));
       const history = db.prepare('INSERT INTO claim_history(claim_ref, status) VALUES (?, ?)');
-      [['CLM-001-XI-00001', 'Submitted'], ['CLM-001-XI-00001', 'Under review'], ['CLM-001-XI-00001', 'Approved'], ['CLM-001-VII-00012', 'Submitted'], ['CLM-001-VII-00012', 'Approved'], ['CLM-001-VII-00012', 'Paid'], ['CLM-001-IVA-00009', 'Submitted'], ['CLM-001-IVA-00009', 'Under review'], ['CLM-001-XI-00017', 'Submitted'], ['CLM-001-XI-00017', 'Approved']].forEach(row => history.run(...row));
+      [['CLM-001-XI-00001', 'Submitted'], ['CLM-001-XI-00001', 'Under Review'], ['CLM-001-XI-00001', 'Approved'], ['CLM-001-VII-00012', 'Submitted'], ['CLM-001-VII-00012', 'Approved'], ['CLM-001-VII-00012', 'Paid'], ['CLM-001-IVA-00009', 'Submitted'], ['CLM-001-IVA-00009', 'Under Review'], ['CLM-001-XI-00017', 'Submitted'], ['CLM-001-XI-00017', 'Approved']].forEach(row => history.run(...row));
       const exception = db.prepare('INSERT INTO exceptions(claim_ref, type, reason) VALUES (?, ?, ?)');
       [['CLM-001-XI-00001', 'Late', 'Review exceeded target time.'], ['CLM-001-VII-00012', 'Duplicate', 'Similar patient token and amount.'], ['CLM-001-XI-00017', 'Outlier', 'Amount outside normal range.'], ['CLM-001-IVA-00009', 'LateFiling', 'Filing date needs validation.'], ['CLM-001-XI-00017', 'Mismatch', 'Supporting amount differs from claim.']].forEach(row => exception.run(...row));
     });
