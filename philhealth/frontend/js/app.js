@@ -3,6 +3,7 @@ import { el, toast } from './ui.js';
 import { loginView } from './views/login.js';
 import { dashboardView } from './views/dashboard.js';
 import { claimsView } from './views/claims.js';
+import { settingsView } from './views/settings.js';
 
 const root = document.querySelector('#app');
 let user;
@@ -27,7 +28,7 @@ async function render() {
     const nav = el('nav', { class: 'nav' }, pages.filter(page => page[2].includes(user.role)).map(page => el('a', { href: `#${page[0]}`, class: route === page[0] ? 'active' : '' }, page[1])));
     const logout = el('button', { class: 'primary', onclick: async () => { try { await api('/logout', { method: 'POST' }); user = null; setCsrfToken(''); render(); } catch (error) { toast(error.message); } } }, 'Log out');
     const dark = el('button', { class: 'theme-toggle', onclick: () => document.body.classList.toggle('dark') }, 'Theme');
-    const view = route === 'dashboard' ? await dashboardView() : route === 'claims' ? await claimsView() : await basicView(route);
+    const view = route === 'dashboard' ? await dashboardView() : route === 'claims' ? await claimsView() : route === 'settings' ? await settingsView(render) : await basicView(route);
     root.replaceChildren(el('section', { class: 'shell' }, el('aside', { class: 'side' }, el('strong', {}, 'PhilHealth Monitor'), nav), el('main', { class: 'work' }, el('header', { class: 'top' }, `${user.username} · ${user.role}`, dark, logout), view)));
   } catch (error) { user = null; setCsrfToken(''); root.replaceChildren(loginView(next => { user = next; render(); })); if (error.message !== 'Authentication required.') toast(error.message); }
 }
