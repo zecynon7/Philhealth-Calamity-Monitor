@@ -1,6 +1,7 @@
 import { appendAudit, requireCsrf } from './auth.js';
 import { canAccessClaim, paidAmount, transitionError } from './rules.js';
 import { schemas, validate } from './routes/schemas.js';
+import { scanExceptions } from './exceptions.js';
 
 const authenticated = (request, reply) => {
   if (!request.user) {
@@ -21,7 +22,51 @@ function validDate(value, asOf) {
   return !value || value <= asOf;
 }
 
+function csvRows(text) {
+  const lines = text.trim().split(/\r?\n/).filter(Boolean);
+  const parse = line => line.match(/(?:^|,)("(?:[^"]|"")*"|[^,]*)/g).map(cell => cell.replace(/^,/, '').replace(/^"|"$/g, '').replace(/""/g, '"').trim());
+  const headers = parse(lines.shift() || '').map(header => header.toLowerCase());
+  return { headers, rows: lines.map(parse) };
+}
+
 export function registerWorkflowRoutes(app, db) {
+  app.post('/api/claims/import', { preHandler: requireCsrf }, async (request, reply) => {
+    if (!authenticated(request, reply)) return;
+    if (request.user.role !== 'ROS') return reply.code(403).send({ error: 'Your role is not allowed to perform this action.' });
+    const input = typeof request.body === 'string' ? request.body : request.body?.csv;
+    if (!input) return reply.code(400).send({ error: 'CSV content is required.' });
+    const { headers, rows } = csvRows(input);
+    if (headers.includes('patient_name')) return reply.code(422).send({ error: 'CSV must not contain patient_name.' });
+    const required = ['ref', 'event_id', 'region', 'token', 'type', 'claimed'];
+    if (!required.every(header => headers.includes(header))) return reply.code(400).send({ error: 'CSV headers do not match the sample format.' });
+    const result = { accepted: [], rejected: [] };
+    const asOf = currentDate(db);
+    for (let index = 0; index < rows.length; index += 1) {
+      const raw = Object.fromEntries(headers.map((header, cell) => [header, rows[index][cell] || '']));
+      const data = schemas.createClaim.safeParse({ ref: raw.ref, eventId: raw.event_id, region: raw.region, token: raw.token,
+        type: raw.type, claimed: Number(raw.claimed), dischargeDate: raw.discharge_date || undefined, filingDate: raw.filing_date || undefined, note: raw.note || undefined });
+      const event = data.success && db.prepare('SELECT status FROM calamity_events WHERE id = ?').get(data.data.eventId);
+      if (!data.success || raw.region !== request.user.region || !event || event.status !== 'Active' ||
+        ![raw.discharge_date, raw.filing_date].every(date => validDate(date, asOf))) {
+        result.rejected.push({ row: index + 2, ref: raw.ref || null, reason: 'Invalid, inactive, future-dated, or other-region row.' });
+        continue;
+      }
+      try {
+        db.prepare(`INSERT INTO claims(ref, event_id, region, patient_token, claim_type, status, claimed_amount, discharge_date, filing_date, encoded_by, note)
+          VALUES (?, ?, ?, ?, ?, 'Submitted', ?, ?, ?, ?, ?)`)
+          .run(data.data.ref, data.data.eventId, data.data.region, data.data.token, data.data.type, data.data.claimed,
+            data.data.dischargeDate || null, data.data.filingDate || null, request.user.id, data.data.note || '');
+        db.prepare('INSERT INTO claim_history(claim_ref, status, actor_id) VALUES (?, ?, ?)').run(data.data.ref, 'Submitted', request.user.id);
+        result.accepted.push({ row: index + 2, ref: data.data.ref });
+      } catch {
+        result.rejected.push({ row: index + 2, ref: raw.ref || null, reason: 'Duplicate claim reference.' });
+      }
+    }
+    scanExceptions(db);
+    appendAudit(db, request.user.id, 'IMPORT', 'Claim', 'CSV', 'CSV import completed', {}, result);
+    return result;
+  });
+
   app.post('/api/claims', { preHandler: [validate(schemas.createClaim), requireCsrf] }, async (request, reply) => {
     if (!authenticated(request, reply)) return;
     if (request.user.role !== 'ROS') return reply.code(403).send({ error: 'Your role is not allowed to perform this action.' });
@@ -40,6 +85,7 @@ export function registerWorkflowRoutes(app, db) {
     db.prepare('INSERT INTO claim_history(claim_ref, status, actor_id, note) VALUES (?, ?, ?, ?)')
       .run(data.ref, 'Submitted', request.user.id, data.note || '');
     appendAudit(db, request.user.id, 'CREATE', 'Claim', data.ref, 'Claim encoded', {}, { status: 'Submitted' });
+    scanExceptions(db);
     return reply.code(201).send(claimFor(db, data.ref));
   });
 
@@ -60,6 +106,7 @@ export function registerWorkflowRoutes(app, db) {
       appendAudit(db, request.user.id, 'PAYMENT', 'Claim', claim.ref, 'Payment recorded', { status: claim.status }, { status: 'Paid', amount: payment.amount });
     });
     transaction();
+    scanExceptions(db);
     return { ref: claim.ref, status: 'Paid', paid: paidAmount(db, claim.ref) };
   });
 
@@ -96,6 +143,7 @@ export function registerWorkflowRoutes(app, db) {
     db.prepare("UPDATE claims SET status = 'Reconciled', note = ? WHERE ref = ?").run(note, claim.ref);
     db.prepare("INSERT INTO claim_history(claim_ref, status, actor_id, note) VALUES (?, 'Reconciled', ?, ?)").run(claim.ref, request.user.id, note);
     appendAudit(db, request.user.id, 'RECONCILE', 'Claim', claim.ref, 'Claim reconciled', { status: 'Paid' }, { status: 'Reconciled' });
+    scanExceptions(db);
     return { ref: claim.ref, status: 'Reconciled' };
   });
 }

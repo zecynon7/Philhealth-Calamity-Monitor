@@ -1,0 +1,2 @@
+ref,event_id,region,token,type,claimed,discharge_date,filing_date,note
+CLM-001-XI-00030,CE-2026-001,XI,PT-12345,Inpatient,125000,2026-09-01,2026-09-15,Sample import row

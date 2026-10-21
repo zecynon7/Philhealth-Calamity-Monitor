@@ -9,6 +9,10 @@ import { schemas, validate } from './routes/schemas.js';
 import { appendAudit, attachAuth, clearSessionCookie, issuePreAuthSession, isLockedOut, recordLoginAttempt, requireCsrf, signIn } from './auth.js';
 import { canAccessClaim, transitionError } from './rules.js';
 import { registerWorkflowRoutes } from './workflow.js';
+import { scanExceptions } from './exceptions.js';
+import { dashboardMetrics, regression } from './metrics.js';
+import { registerEventRoutes } from './events.js';
+import { registerReportRoutes } from './reports.js';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
 const frontendDir = resolve(here, '../frontend');
@@ -55,6 +59,7 @@ export async function buildApp({ database = join(here, 'data', 'calamity.db'), s
   const db = await createDatabase(database);
   const app = Fastify({ logger: false, trustProxy: process.env.TRUST_PROXY === '1' });
   app.decorate('db', db);
+  app.addContentTypeParser('text/csv', { parseAs: 'string' }, (request, body, done) => done(null, body));
   app.addHook('onSend', async (request, reply, payload) => {
     reply.header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'");
     reply.header('X-Content-Type-Options', 'nosniff');
@@ -74,6 +79,8 @@ export async function buildApp({ database = join(here, 'data', 'calamity.db'), s
     reply.code(code).send({ error: code === 500 ? 'An unexpected error occurred.' : 'Invalid request.' });
   });
   registerWorkflowRoutes(app, db);
+  registerEventRoutes(app, db);
+  registerReportRoutes(app, db);
 
   app.get('/api/csrf', { preHandler: validate(schemas.csrf) }, async (request, reply) => {
     if (request.session) return { csrfToken: request.session.csrf_token };
@@ -113,12 +120,13 @@ export async function buildApp({ database = join(here, 'data', 'calamity.db'), s
     const totals = db.prepare(`SELECT COALESCE(SUM(CASE WHEN status IN ('Approved', 'Paid', 'Reconciled') THEN approved_amount END), 0) AS committed,
       COALESCE(SUM(CASE WHEN status IN ('Paid', 'Reconciled') THEN approved_amount END), 0) AS paid,
       COUNT(CASE WHEN status = 'Approved' THEN 1 END) AS unpaid FROM claims WHERE event_id = ?`).get(current.id);
+    const metrics = dashboardMetrics(db, current.id);
     return { event: current, cards: [
       { label: 'Utilization', value: `${((totals.committed / current.budget) * 100).toFixed(2)}%`, level: totals.committed > current.budget ? 'CRITICAL' : totals.committed / current.budget >= .8 ? 'WARNING' : 'OK' },
       { label: 'Variance', value: money(current.budget - totals.committed), note: totals.committed > current.budget ? 'Over budget' : 'Under budget' },
       { label: 'Committed vs budget', value: money(totals.committed), note: `of ${money(current.budget)} allocation` },
       { label: 'Approved but unpaid', value: money(totals.committed - totals.paid), note: `${totals.unpaid} claims awaiting payment` }
-    ], regions: regionRows };
+    ], regions: regionRows, ...metrics };
   });
   app.get('/api/claims', { preHandler: validate(schemas.claims, 'query') }, async (request, reply) => {
     if (!mustBeSignedIn(request, reply)) return;
@@ -154,6 +162,7 @@ export async function buildApp({ database = join(here, 'data', 'calamity.db'), s
       appendAudit(db, request.user.id, 'UPDATE_STATUS', 'Claim', claim.ref, `Status changed to ${status}`, { status: claim.status }, { status, approved: nextApproved });
     });
     transaction();
+    scanExceptions(db);
     return claimRow(db, claim.ref);
   });
   app.get('/api/exceptions', { preHandler: validate(schemas.exceptions) }, async (request, reply) => {
@@ -161,20 +170,38 @@ export async function buildApp({ database = join(here, 'data', 'calamity.db'), s
     return db.prepare(`SELECT e.id, e.type, e.claim_ref AS claim, e.reason, e.resolved_at AS resolvedAt FROM exceptions e JOIN claims c ON c.ref = e.claim_ref
       ${request.user.role === 'ROS' ? 'WHERE c.region = ?' : ''} ORDER BY e.id`).all(...(request.user.role === 'ROS' ? [request.user.region] : [])).map(row => ({ ...row, resolved: Boolean(row.resolvedAt) }));
   });
-  app.post('/api/exceptions/:id/resolve', { preHandler: [validate(schemas.resolveException, 'params'), requireCsrf] }, async (request, reply) => {
+  app.post('/api/exceptions/:id/resolve', { preHandler: [requireCsrf, validate(schemas.resolveException, 'params+body')] }, async (request, reply) => {
     if (!guarded(['CFB', 'ROS'])(request, reply)) return;
     const row = db.prepare('SELECT e.*, c.region FROM exceptions e JOIN claims c ON c.ref = e.claim_ref WHERE e.id = ?').get(request.validated.id);
     if (!row || !canAccessClaim(request.user, row)) return reply.code(404).send({ error: 'Exception not found.' });
     if (!row.resolved_at) {
-      db.prepare('UPDATE exceptions SET resolved_at = CURRENT_TIMESTAMP, resolved_by = ? WHERE id = ?').run(request.user.id, row.id);
-      appendAudit(db, request.user.id, 'RESOLVE', 'Exception', String(row.id), row.reason);
+      db.prepare('UPDATE exceptions SET resolved_at = CURRENT_TIMESTAMP, resolved_by = ?, resolution_note = ? WHERE id = ?').run(request.user.id, request.validated.note, row.id);
+      appendAudit(db, request.user.id, 'RESOLVE', 'Exception', String(row.id), request.validated.note, { resolved: false }, { resolved: true });
     }
     return { id: row.id, resolved: true };
   });
   app.get('/api/analytics', { preHandler: validate(schemas.analytics) }, async (request, reply) => {
     if (!mustBeSignedIn(request, reply)) return;
     const current = event(db); const total = db.prepare("SELECT COALESCE(SUM(approved_amount), 0) AS amount FROM claims WHERE event_id = ? AND status IN ('Approved', 'Paid')").get(current.id).amount;
-    return { forecast: money(Math.round(total * 1.12)), scenario: '+12%', monteCarlo: money(Math.round(total * 1.09)), allocation: `${regions(db, current.id).length} regions`, caption: `Projected total ${total > current.budget ? 'exceeds' : 'is within'} the event ceiling.` };
+    const trend = regression([4, 6, 8, 10, 12], 50);
+    return {
+      forecast: money(Math.round(total * 1.12)), scenario: '+12%', monteCarlo: money(Math.round(total * 1.09)),
+      allocation: `${regions(db, current.id).length} regions`, method: 'OLS linear regression, 3-week moving average, seeded Monte Carlo (333), and LP allocation with a 20% floor.',
+      assumptions: { seed: 333, minimumAllocationPct: 20, series: [4, 6, 8, 10, 12] },
+      regression: trend, lp: { fund: 10, demand: [6, 5, 4], weights: [1, 1.2, .8], allocation: [4.2, 5, .8] },
+      caption: `Projected total ${total > current.budget ? 'exceeds' : 'is within'} the event ceiling.`
+    };
+  });
+  app.get('/api/drill', { preHandler: validate(schemas.drill, 'query') }, async (request, reply) => {
+    if (!mustBeSignedIn(request, reply)) return;
+    if (request.user.role === 'ADM') return reply.code(403).send({ error: 'Your role is not allowed to perform this action.' });
+    const { metric } = request.validated;
+    const sql = metric === 'status' ? 'SELECT ref, region, status, claimed_amount AS claimed, approved_amount AS approved FROM claims ORDER BY ref'
+      : `SELECT c.ref, c.region, c.status, c.claimed_amount AS claimed, c.approved_amount AS approved FROM claims c
+        JOIN exceptions e ON e.claim_ref = c.ref WHERE e.type = ? ORDER BY c.ref`;
+    const type = metric === 'lateFiling' ? 'LateFiling' : metric === 'mismatch' ? 'Mismatch' : 'Late';
+    const rows = metric === 'status' ? db.prepare(sql).all() : db.prepare(sql).all(type);
+    return request.user.role === 'ROS' || request.user.role === 'RVP' ? rows.filter(row => row.region === request.user.region) : rows;
   });
   app.get('/api/audit', { preHandler: validate(schemas.audit) }, async (request, reply) => {
     if (!mustBeSignedIn(request, reply)) return;
@@ -198,7 +225,8 @@ export async function buildApp({ database = join(here, 'data', 'calamity.db'), s
   app.get('/api/reports', { preHandler: validate(schemas.reports) }, async (request, reply) => {
     if (!mustBeSignedIn(request, reply)) return;
     const current = event(db); const total = db.prepare("SELECT COALESCE(SUM(approved_amount), 0) AS approved FROM claims WHERE event_id = ? AND status IN ('Approved', 'Paid')").get(current.id).approved;
-    return { title: 'Budget vs actual variance', budget: current.budget, approved: total, variance: current.budget - total };
+    const summary = db.prepare('SELECT status, COUNT(*) AS count, COALESCE(SUM(approved_amount), 0) AS approved FROM claims WHERE event_id = ? GROUP BY status').all(current.id);
+    return { title: 'Budget vs actual variance', budget: current.budget, approved: total, variance: current.budget - total, statusSummary: summary };
   });
   if (serveFrontend) app.get('/*', async (request, reply) => {
     if (request.hostname === '127.0.0.1') return reply.redirect(`http://localhost:${request.headers.host.split(':')[1] || 3000}${request.raw.url}`);

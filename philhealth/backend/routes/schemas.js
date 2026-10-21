@@ -25,8 +25,9 @@ export const schemas = {
   reconcile: z.object({ note: z.string().trim().max(1000).optional() }),
   settings: z.object({ value: z.string().trim().min(1).max(64), reason: z.string().trim().min(1).max(1000) }),
   exceptions: z.object({}),
-  resolveException: z.object({ id: z.coerce.number().int().positive() }),
+  resolveException: z.object({ id: z.coerce.number().int().positive(), note: z.string().trim().min(1).max(1000) }),
   analytics: z.object({}),
+  drill: z.object({ metric: z.enum(['aging', 'lateFiling', 'mismatch', 'status']).default('aging') }),
   audit: z.object({
     page: z.coerce.number().int().positive().default(1),
     pageSize: z.coerce.number().int().min(1).max(100).default(25)
