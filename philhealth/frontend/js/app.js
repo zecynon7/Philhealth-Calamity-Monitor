@@ -18,8 +18,12 @@ async function basicView(route) {
 async function render() {
   try {
     if (!user) { const session = await api('/me'); user = session.user; setCsrfToken(session.csrfToken); }
-    const route = location.hash.slice(1) || 'dashboard';
-    if (!pages.find(page => page[0] === route)?.[2]?.includes(user.role)) throw new Error('Your role is not allowed to view this page.');
+    let route = location.hash.slice(1) || 'dashboard';
+    const permitted = pages.filter(page => page[2].includes(user.role));
+    if (!permitted.some(page => page[0] === route)) {
+      route = permitted[0][0];
+      history.replaceState(null, '', `#${route}`);
+    }
     const nav = el('nav', { class: 'nav' }, pages.filter(page => page[2].includes(user.role)).map(page => el('a', { href: `#${page[0]}`, class: route === page[0] ? 'active' : '' }, page[1])));
     const logout = el('button', { class: 'primary', onclick: async () => { try { await api('/logout', { method: 'POST' }); user = null; setCsrfToken(''); render(); } catch (error) { toast(error.message); } } }, 'Log out');
     const dark = el('button', { class: 'theme-toggle', onclick: () => document.body.classList.toggle('dark') }, 'Theme');
